@@ -3,3 +3,5 @@ __MACOSX/
 .DS_Store
 logs/
 wandb/
+HW/HW5/dataset/
+nowcastingHWdataset.tar.gz
