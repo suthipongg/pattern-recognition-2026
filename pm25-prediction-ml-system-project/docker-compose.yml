@@ -1,0 +1,210 @@
+version: "3.8"
+
+# -----------------------------------------------------------------------
+# Shared Airflow configuration (YAML anchor)
+# -----------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /app/dags
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    PM25_DB_URL: ${PM25_DB_URL:-postgresql://postgres:postgres@postgres:5432/pm25}
+    PM25_API_URL: ${PM25_API_URL:-http://api:8000}
+    API_KEY: ${API_KEY:-foonalert-secret-key}
+    PM25_PREDICTIONS_TABLE: ${PM25_PREDICTIONS_TABLE:-pm25_api_daily_predictions}
+    PREDICTION_SOURCE_STATION_ID: ${PREDICTION_SOURCE_STATION_ID:-56}
+    PREDICTION_HISTORY_DAYS: ${PREDICTION_HISTORY_DAYS:-15}
+  volumes:
+    - ./dags:/app/dags
+    - ./src:/app/src
+    - ./configs:/app/configs
+    - ./data:/app/data
+    - ./models:/app/models
+    - ./results:/app/results
+    - airflow_logs:/opt/airflow/logs
+#    - ./triton_model_repo:/app/triton_model_repo
+
+# -----------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------
+services:
+
+  # --- Shared Postgres (Airflow metadata + MLflow backend) ---
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- MLflow tracking server ---
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    environment:
+      GUNICORN_CMD_ARGS: "--forwarded-allow-ips=*"
+      MLFLOW_ALLOWED_HOSTS: "mlflow,localhost,127.0.0.1,0.0.0.0,*"
+    command: >
+      mlflow server
+      --backend-store-uri postgresql+psycopg2://mlflow:mlflow@postgres/mlflow
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+      --host 0.0.0.0
+      --port 5000
+      --allowed-hosts "*"
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # --- Airflow DB init (runs once) ---
+  airflow-init:
+    <<: *airflow-common
+    build:
+      context: .
+      args:
+        INSTALL_ML_DEPS: "false"
+    command: >-
+      bash -c "airflow db migrate &&
+      airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin"
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- Airflow webserver ---
+  airflow-webserver:
+    <<: *airflow-common
+    build:
+      context: .
+      args:
+        INSTALL_ML_DEPS: "false"
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      - airflow-init
+      - mlflow
+    restart: unless-stopped
+
+  # --- Airflow scheduler ---
+  airflow-scheduler:
+    <<: *airflow-common
+    build:
+      context: .
+      args:
+        INSTALL_ML_DEPS: "true"
+    command: airflow scheduler
+    depends_on:
+      - airflow-init
+      - mlflow
+    restart: unless-stopped
+
+  # --- Triton Inference Server ---
+  triton:
+    image: nvcr.io/nvidia/tritonserver:24.08-py3
+    command: >
+      tritonserver
+      --model-repository=/models
+      --model-control-mode=poll
+      --repository-poll-secs=30
+      --log-verbose=0
+    ports:
+      - "8020:8000"   # HTTP inference
+      - "8021:8001"   # gRPC inference
+      - "8022:8002"   # metrics
+    volumes:
+      - ./triton_model_repo:/models
+    shm_size: "256m"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v2/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # --- PM2.5 Prediction API ---
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8005:8000"
+    volumes:
+      - ./models:/app/models
+      - ./results:/app/results
+    environment:
+      MODEL_NAME: random_forest
+      AIRFLOW_URL: http://airflow-webserver:8080
+      AIRFLOW_USER: admin
+      AIRFLOW_PASSWORD: admin
+      RMSE_THRESHOLD: "9.0"
+      API_KEY: ${API_KEY:-foonalert-secret-key}
+      INFERENCE_BACKEND: triton
+      TRITON_URL: triton:8000
+    depends_on:
+      triton:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- FoonAlert Demo App (Tournament) ---
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+    ports:
+      - "8502:8502"
+    volumes:
+      - ./demo_data:/app/demo_data
+    environment:
+      PM25_DB_URL: ${PM25_DB_URL:-postgresql://postgres:postgres@postgres:5432/pm25}
+    restart: unless-stopped
+
+  # --- Streamlit Dashboard ---
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8505:8501"
+    volumes:
+      - ./results:/app/results
+    environment:
+      API_URL: http://api:8000
+      API_KEY: ${API_KEY:-foonalert-secret-key}
+      RESULTS_DIR: /app/results
+      PM25_DB_URL: ${PM25_DB_URL:-postgresql://postgres:postgres@postgres:5432/pm25}
+    depends_on:
+      - api
+    restart: unless-stopped
+
+# -----------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------
+volumes:
+  postgres_data:
+  mlflow_artifacts:
+  airflow_logs:
